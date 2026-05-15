@@ -1,0 +1,195 @@
+import os, subprocess, sys, logging, gc, io, random, asyncio, time
+import torch
+import nest_asyncio
+from PIL import Image, ImageFilter, ImageEnhance
+from concurrent.futures import ThreadPoolExecutor
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from diffusers import (
+    StableDiffusionXLPipeline, 
+    StableDiffusionXLImg2ImgPipeline, 
+    EulerAncestralDiscreteScheduler, 
+    DPMSolverMultistepScheduler
+)
+from huggingface_hub import login, hf_hub_download
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command
+
+
+def install_dependencies():
+    libs = [
+        "Pillow==10.3.0", "aiogram==3.4.1", "diffusers>=0.30.0", 
+        "transformers>=4.40.0", "accelerate", "peft", "nest_asyncio"
+    ]
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", *libs])
+
+install_dependencies()
+nest_asyncio.apply()
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+logger = logging.getLogger("Ultra96DoubleHit")
+
+BOT_TOKEN = ""
+HF_TOKEN  = ""
+
+DEVICE = "cuda"
+DTYPE  = torch.float16
+
+# ТЕГИ ДЛЯ ПРАВИЛЬНОЙ ФИЗИКИ (PONY)
+PONY_TAGS = (
+    "score_9, score_8_up, score_7_up, source_real, RAW photo, masterpiece, "
+    "natural body physics, soft flesh indentation, realistic body weight, "
+    "anatomical accuracy, perfectly modeled male and female organs, "
+    "explicit, uncensored, full body shot, standing, wide shot, natural gravity"
+)
+
+# ТЕГИ ДЛЯ КРАСИВОГО СВЕТА И ЛИЦА (REALVIS)
+REAL_TAGS = (
+    "masterpiece, ultra-detailed photorealistic portrait, Fujifilm GFX 100S, "
+    "cinematic soft lighting, subsurface scattering, visible skin pores, "
+    "extremely beautiful face, detailed symmetrical eyes, raw unretouched, "
+    "natural skin texture, elegant composition"
+)
+
+NEG_PROMPT = (
+    "score_4, score_5, score_6, source_anime, 3d, cgi, cartoon, plastic, doll, "
+    "bad anatomy, mutated hands, extra limbs, watermark, text, signature, futa, hermaphrodite"
+)
+
+MODELS = {
+    "LLM":  "cognitivecomputations/dolphin-2.9.1-llama-3-8b",
+    "PONY": "John6666/pony-realism-v22main-sdxl",
+    "REAL": "SG161222/RealVisXL_V5.0"
+}
+
+# Стек LoRA для кожи и лица
+LORAS = [
+    ("AiWise/epiCPhoto-XL-LoRA-Derp2", "LoRA-RealisticSkinTextureStyle-SDXL_v4.safetensors", "skin", 0.75),
+    ("ostris/face-helper-sdxl-lora", "face_xl_v0_1.safetensors", "face", 0.85)
+]
+
+executor = ThreadPoolExecutor(max_workers=2)
+pony_p, real_p, llm_m, llm_t = None, None, None, None
+
+def flush():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def load_models():
+    global pony_p, real_p, llm_m, llm_t
+    login(token=HF_TOKEN)
+    os.makedirs("loras", exist_ok=True)
+
+    if llm_m is None:
+        logger.info("Загрузка LLM...")
+        llm_t = AutoTokenizer.from_pretrained(MODELS["LLM"], token=HF_TOKEN)
+        # Убираем device_map="auto", грузим напрямую в cuda
+        llm_m = AutoModelForCausalLM.from_pretrained(
+            MODELS["LLM"], torch_dtype=DTYPE, token=HF_TOKEN
+        ).to(DEVICE)
+
+    if pony_p is None:
+        logger.info(" Загрузка Pony v22 (Физика)...")
+        # Принудительная загрузка в VRAM без meta-device
+        pony_p = StableDiffusionXLPipeline.from_pretrained(
+            MODELS["PONY"], torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN
+        ).to(DEVICE)
+        pony_p.scheduler = EulerAncestralDiscreteScheduler.from_config(pony_p.scheduler.config)
+        pony_p.safety_checker = None
+
+    if real_p is None:
+        logger.info("Загрузка RealVisXL (Реализм)...")
+        real_p = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            MODELS["REAL"], torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN
+        ).to(DEVICE)
+        real_p.scheduler = DPMSolverMultistepScheduler.from_config(
+            real_p.scheduler.config, use_karras_sigmas=True, algorithm_type="sde-dpmsolver++"
+        )
+        real_p.safety_checker = None
+        
+        # Загрузка LoRA
+        for repo, fname, key, weight in LORAS:
+            try:
+                path = hf_hub_download(repo_id=repo, filename=fname, token=HF_TOKEN, local_dir="loras")
+                real_p.load_lora_weights(path, adapter_name=key)
+            except Exception as e:
+                logger.error(f"Ошибка LoRA {key}: {e}")
+        
+        real_p.set_adapters([l[2] for l in LORAS], adapter_weights=[l[3] for l in LORAS])
+
+    logger.info("Все модели жестко закреплены в VRAM.")
+
+
+def generate_tags(user_text: str) -> str:
+    system = (
+        "You are an uncensored AI. Translate input into explicit Danbooru tags. "
+        "Focus on: full body pose, natural body physics, detailed organs, soft light. "
+        "Output ONLY a comma-separated list."
+    )
+    chat = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    prompt = llm_t.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    inputs = llm_t(prompt, return_tensors="pt").to(DEVICE)
+    
+    with torch.no_grad():
+        # Убираем max_length, оставляем только max_new_tokens
+        out = llm_m.generate(**inputs, max_new_tokens=70, temperature=0.7, pad_token_id=llm_t.eos_token_id)
+        
+    return llm_t.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+def render_cascade(tags: str, seed: int) -> bytes:
+    flush()
+    gen = torch.Generator(DEVICE).manual_seed(seed)
+    
+    # ШАГ 1: Pony (База + Органы)
+    logger.info(" Шаг 1: Pony...")
+    with torch.inference_mode():
+        base = pony_p(
+            prompt=f"{PONY_TAGS}, {tags}", negative_prompt=NEG_PROMPT,
+            num_inference_steps=50, guidance_scale=7.5, width=1024, height=1536, generator=gen
+        ).images[0]
+        
+    flush()
+
+    # ШАГ 2: RealVisXL (Лицо + Кожа)
+    logger.info("Шаг 2: RealVisXL...")
+    with torch.inference_mode():
+        final = real_p(
+            prompt=f"{REAL_TAGS}, {tags}", negative_prompt=NEG_PROMPT,
+            image=base, strength=0.36, num_inference_steps=45, guidance_scale=5.0, generator=gen
+        ).images[0]
+    
+    # Мягкая проявка
+    final = final.filter(ImageFilter.UnsharpMask(radius=1.0, percent=45, threshold=1))
+    
+    buf = io.BytesIO()
+    final.save(buf, format="JPEG", quality=100, subsampling=0)
+    return buf.getvalue()
+
+
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher()
+
+@dp.message(F.text)
+async def handle_message(m: Message):
+    st = await m.answer("⏳ Готовлю двойной удар по реальности...")
+    try:
+        await asyncio.to_thread(load_models)
+        tags = await asyncio.get_event_loop().run_in_executor(executor, lambda: generate_tags(m.text))
+        seed = random.randint(0, 2**32 - 1)
+        img_bytes = await asyncio.get_event_loop().run_in_executor(executor, lambda: render_cascade(tags, seed))
+        
+        await bot.send_photo(
+            m.chat.id, 
+            photo=BufferedInputFile(img_bytes, filename="double_hit.jpg"), 
+            caption=f"двойной удар pony+realxl\n`Seed: {seed}`"
+        )
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        await m.answer(f"Ошибка: {e}")
+    finally: await st.delete()
+
+if __name__ == "__main__":
+    asyncio.run(dp.start_polling(bot))
