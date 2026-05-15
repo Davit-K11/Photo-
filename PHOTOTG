@@ -1,0 +1,113 @@
+import os, asyncio, torch
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from diffusers import StableDiffusionXLPipeline, WanImageToVideoPipeline
+from diffusers.utils import export_to_video
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("export BOT_TOKEN='твой_токен'")
+
+DTYPE = torch.bfloat16
+DEVICE = "cuda"
+user_states = {}
+
+MODEL_PATH = "real_model.safetensors" 
+
+img_pipe = None
+vid_pipe = None
+
+def load_models():
+    global img_pipe, vid_pipe
+    
+    if img_pipe is None:
+        img_pipe = StableDiffusionXLPipeline.from_single_file(
+            MODEL_PATH, 
+            torch_dtype=torch.float16
+        ).to(DEVICE)
+
+    if vid_pipe is None:
+        vid_pipe = WanImageToVideoPipeline.from_pretrained(
+            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", 
+            torch_dtype=DTYPE
+        ).to(DEVICE)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="ОЖИВИТЬ РЕАЛИСТИЧНО")]], 
+        resize_keyboard=True
+    )
+
+@dp.message(F.text == "ОЖИВИТЬ РЕАЛИСТИЧНО")
+async def handle_animate(message: Message):
+    chat_id = message.chat.id
+    if chat_id not in user_states:
+        await message.answer("Сначала создай фото-кадр.")
+        return
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, load_models)
+
+    state = user_states[chat_id]
+    image = state['image']
+
+    def generate_video():
+        video_prompt = state['prompt'] + ", highly detailed face, hyperrealistic motion, 8k resolution, cinematic lighting, raw footage, natural fluid movement"
+        
+        frames = vid_pipe(
+            prompt=video_prompt,
+            image=image,
+            num_frames=81, 
+            num_inference_steps=35,
+            guidance_scale=5.5
+        ).frames[0]
+        
+        path = f"video_{chat_id}.mp4"
+        export_to_video(frames, path, fps=16)
+        return path
+
+    path = await loop.run_in_executor(None, generate_video)
+    await message.answer_video(FSInputFile(path), caption="Реалистичное видео готово!")
+    os.remove(path)
+
+@dp.message(F.text)
+async def handle_prompt(message: Message):
+    chat_id = message.chat.id
+    text = message.text
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, load_models)
+
+    def generate_image():
+        photo_tags = "raw photo, photography, ultra realistic, highly detailed, 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT4, "
+        negative_tags = "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, smooth skin, plastic"
+
+        return img_pipe(
+            prompt=photo_tags + text,
+            negative_prompt=negative_tags,
+            num_inference_steps=30, 
+            guidance_scale=6.0,
+            width=896, height=1152
+        ).images[0]
+
+    image = await loop.run_in_executor(None, generate_image)
+    
+    path = f"img_{chat_id}.png"
+    image.save(path)
+    user_states[chat_id] = {'image': image, 'prompt': text}
+
+    await message.answer_photo(
+        FSInputFile(path), 
+        caption="Фотография готова. Запустить генерацию видео?", 
+        reply_markup=main_keyboard()
+    )
+    os.remove(path)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
