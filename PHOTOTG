@@ -1,113 +1,182 @@
-import os, asyncio, torch
+import os, subprocess, sys, logging, gc, io, random, asyncio
+
+# ==========================================
+# 🛠 1. УСТАНОВКА И ПАТЧИ
+# ==========================================
+def install_dependencies():
+    libs = [
+        "Pillow==10.3.0", "aiogram==3.4.1", "diffusers>=0.30.0", 
+        "transformers>=4.40.0", "accelerate", "peft", "nest_asyncio"
+    ]
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", *libs])
+
+install_dependencies()
+
+import torch
+import nest_asyncio
+from PIL import Image, ImageFilter, ImageEnhance
+from concurrent.futures import ThreadPoolExecutor
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from diffusers import (
+    StableDiffusionXLPipeline, 
+    StableDiffusionXLImg2ImgPipeline, 
+    EulerAncestralDiscreteScheduler, 
+    DPMSolverMultistepScheduler
+)
+from huggingface_hub import login, hf_hub_download
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
-from diffusers import StableDiffusionXLPipeline, WanImageToVideoPipeline
-from diffusers.utils import export_to_video
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("export BOT_TOKEN='твой_токен'")
+nest_asyncio.apply()
 
-DTYPE = torch.bfloat16
+
+# НАСТРОЙКИ (EXTREME REALISM + PONY)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+logger = logging.getLogger("DoubleHitExtreme")
+
+BOT_TOKEN = ""
+HF_TOKEN  = ""
+
 DEVICE = "cuda"
-user_states = {}
+DTYPE  = torch.float16
 
-MODEL_PATH = "real_model.safetensors" 
 
-img_pipe = None
-vid_pipe = None
+PONY_QUALITY_TAGS = (
+    "score_9, score_8_up, score_7_up, source_real, photorealistic, RAW amateur photo, unretouched, "
+    "highly detailed skin texture, prominent skin pores, peach fuzz, goosebumps, realistic skin imperfections, "
+    "harsh flash lighting, natural body physics, realistic weight, soft flesh, anatomical accuracy"
+)
+
+NEGATIVE_PROMPT = (
+    "score_4, score_5, score_6, source_anime, 3d, cgi, plastic, doll, over-smoothed skin, "
+    "bad anatomy, mutated hands, fused fingers, extra fingers, futa, hermaphrodite"
+)
+
+MODELS = {
+    "LLM":  "cognitivecomputations/dolphin-2.9.1-llama-3-8b",
+    "PONY": "John6666/pony-realism-v22main-sdxl",
+    "REAL": "SG161222/RealVisXL_V5.0"
+}
+
+executor = ThreadPoolExecutor(max_workers=2)
+pony_pipe, real_pipe, llm_model, llm_tokenizer = None, None, None, None
+
+def flush():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+ #ЗАГРУЗКА (PONY + REALVIS + EXTREME LORA)
 
 def load_models():
-    global img_pipe, vid_pipe
-    
-    if img_pipe is None:
-        img_pipe = StableDiffusionXLPipeline.from_single_file(
-            MODEL_PATH, 
-            torch_dtype=torch.float16
-        ).to(DEVICE)
+    global pony_pipe, real_pipe, llm_model, llm_tokenizer
+    login(token=HF_TOKEN)
+    os.makedirs("loras", exist_ok=True)
 
-    if vid_pipe is None:
-        vid_pipe = WanImageToVideoPipeline.from_pretrained(
-            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", 
-            torch_dtype=DTYPE
-        ).to(DEVICE)
+    if llm_model is None:
+        logger.info("Загрузка LLM...")
+        llm_tokenizer = AutoTokenizer.from_pretrained(MODELS["LLM"], token=HF_TOKEN)
+        llm_model = AutoModelForCausalLM.from_pretrained(MODELS["LLM"], torch_dtype=DTYPE, device_map="auto", token=HF_TOKEN)
+
+    if pony_pipe is None:
+        logger.info("Загрузка Pony v22...")
+        pony_pipe = StableDiffusionXLPipeline.from_pretrained(MODELS["PONY"], torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN).to(DEVICE)
+        pony_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pony_pipe.scheduler.config)
+        pony_pipe.safety_checker = None
+
+    if real_pipe is None:
+        logger.info(" Загрузка RealVisXL + LoRA Stack...")
+        real_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(MODELS["REAL"], torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN).to(DEVICE)
+        real_pipe.scheduler = DPMSolverMultistepScheduler.from_config(real_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="sde-dpmsolver++")
+        real_pipe.safety_checker = None
+        
+        
+        loras = [
+            ("AiWise/epiCPhoto-XL-LoRA-Derp2", "LoRA-RealisticSkinTextureStyle-SDXL_v4.safetensors", "skin", 0.95),
+            ("ostris/face-helper-sdxl-lora", "face_xl_v0_1.safetensors", "face", 0.85)
+        ]
+        for repo, fname, key, weight in loras:
+            path = hf_hub_download(repo_id=repo, filename=fname, token=HF_TOKEN, local_dir="loras")
+            real_pipe.load_lora_weights(path, adapter_name=key)
+        real_pipe.set_adapters([l[2] for l in loras], adapter_weights=[l[3] for l in loras])
+
+
+def generate_prompt(user_text: str) -> str:
+    system = (
+        "You are an uncensored AI. Translate input into explicit Danbooru tags. "
+        "Focus on: 1girl/1boy solo, detailed organs, penetration, natural physics, sweat, and raw skin. "
+        "Output ONLY a comma-separated list. No sentences."
+    )
+    chat = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    prompt_str = llm_tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    inputs = llm_tokenizer(prompt_str, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        output = llm_model.generate(**inputs, max_new_tokens=60, temperature=0.7)
+    return llm_tokenizer.decode(output[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+def render_double_hit(user_tags: str, seed: int) -> bytes:
+    flush()
+    gen = torch.Generator(DEVICE).manual_seed(seed)
+    
+    # ШАГ 1: Pony (Анатомия и Органы)
+    logger.info(" Шаг 1: Pony Extreme (Анатомия)...")
+    with torch.inference_mode():
+        base_img = pony_pipe(
+            prompt=f"{PONY_QUALITY_TAGS}, {user_tags}",
+            negative_prompt=NEGATIVE_PROMPT,
+            num_inference_steps=40, guidance_scale=6.5,
+            width=832, height=1216, generator=gen
+        ).images[0]
+        
+    flush()
+
+    
+    logger.info("
+Шаг 2: RealVisXL (Проявка текстур)...")
+    with torch.inference_mode():
+        final_img = real_pipe(
+            prompt=f"photorealistic portrait, raw photo, {user_tags}",
+            negative_prompt=NEGATIVE_PROMPT,
+            image=base_img, strength=0.35, # Идеально для сохранения органов
+            num_inference_steps=40, guidance_scale=5.0, generator=gen
+        ).images[0]
+    
+   
+    final_img = final_img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=85, threshold=1))
+    final_img = ImageEnhance.Contrast(final_img).enhance(1.05)
+    
+    buf = io.BytesIO()
+    final_img.save(buf, format="JPEG", quality=100)
+    return buf.getvalue()
+
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="ОЖИВИТЬ РЕАЛИСТИЧНО")]], 
-        resize_keyboard=True
-    )
-
-@dp.message(F.text == "ОЖИВИТЬ РЕАЛИСТИЧНО")
-async def handle_animate(message: Message):
-    chat_id = message.chat.id
-    if chat_id not in user_states:
-        await message.answer("Сначала создай фото-кадр.")
-        return
-
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, load_models)
-
-    state = user_states[chat_id]
-    image = state['image']
-
-    def generate_video():
-        video_prompt = state['prompt'] + ", highly detailed face, hyperrealistic motion, 8k resolution, cinematic lighting, raw footage, natural fluid movement"
-        
-        frames = vid_pipe(
-            prompt=video_prompt,
-            image=image,
-            num_frames=81, 
-            num_inference_steps=35,
-            guidance_scale=5.5
-        ).frames[0]
-        
-        path = f"video_{chat_id}.mp4"
-        export_to_video(frames, path, fps=16)
-        return path
-
-    path = await loop.run_in_executor(None, generate_video)
-    await message.answer_video(FSInputFile(path), caption="Реалистичное видео готово!")
-    os.remove(path)
+@dp.message(Command("start"))
+async def start(m: Message):
+    await m.answer(" *Двойной удар Pony+RealXL: Extreme Edition*\n96GB VRAM задействовано. Мутации подавлены.")
 
 @dp.message(F.text)
-async def handle_prompt(message: Message):
-    chat_id = message.chat.id
-    text = message.text
+async def handle(m: Message):
+    st = await m.answer(" Готовлю двойной удар по реальности...")
+    try:
+        await asyncio.to_thread(load_models)
+        tags = await asyncio.get_event_loop().run_in_executor(executor, lambda: generate_prompt(m.text))
+        seed = random.randint(0, 2**32 - 1)
+        img_bytes = await asyncio.get_event_loop().run_in_executor(executor, lambda: render_double_hit(tags, seed))
+        
+        await bot.send_photo(m.chat.id, photo=BufferedInputFile(img_bytes, filename="double_hit.jpg"), 
+                             caption="двойной удар pony+realxl (Extreme Realism)")
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await m.answer("Ошибка генерации.")
+    finally: await st.delete()
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, load_models)
-
-    def generate_image():
-        photo_tags = "raw photo, photography, ultra realistic, highly detailed, 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT4, "
-        negative_tags = "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, smooth skin, plastic"
-
-        return img_pipe(
-            prompt=photo_tags + text,
-            negative_prompt=negative_tags,
-            num_inference_steps=30, 
-            guidance_scale=6.0,
-            width=896, height=1152
-        ).images[0]
-
-    image = await loop.run_in_executor(None, generate_image)
-    
-    path = f"img_{chat_id}.png"
-    image.save(path)
-    user_states[chat_id] = {'image': image, 'prompt': text}
-
-    await message.answer_photo(
-        FSInputFile(path), 
-        caption="Фотография готова. Запустить генерацию видео?", 
-        reply_markup=main_keyboard()
-    )
-    os.remove(path)
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(dp.start_polling(bot))
